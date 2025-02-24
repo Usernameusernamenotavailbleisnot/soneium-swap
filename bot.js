@@ -4,14 +4,14 @@ const chalk = require('chalk');
 
 // Configuration
 const config = {
-    RPC_URL: 'https://rpc.soneium.org/',
+    RPC_URL: 'https://soneium.drpc.org',
     CHAIN_ID: 1868,
     QUICKSWAP_ROUTER: '0xeba58c20629ddab41e21a3e4e2422e583ebd9719',
     TOKEN_IN: '0x4200000000000000000000000000000000000006',
     TOKEN_OUT: '0xbA9986D2381edf1DA03B0B9c1f8b00dc4AacC369',
     POOL_FEE: '0x0000000000000000000000000000000000000000',
     DEFAULT_AMOUNT: '0.00002',
-    GAS_PRICE_GWEI: '0.0012'
+    GAS_PRICE_GWEI: '0.01' // Fallback gas price
 };
 
 const timeHelper = {
@@ -29,8 +29,12 @@ const formatHelper = {
     formatUsdcValue: (value) => {
         const usdc = ethers.utils.formatUnits(value, 6);
         return `${parseFloat(usdc).toFixed(6)} USDC`;
+    },
+    formatGwei: (wei) => {
+        return `${ethers.utils.formatUnits(wei, 'gwei')} Gwei`;
     }
 };
+
 // Logging functions
 const logger = {
     info: (msg) => console.log(chalk.gray(timeHelper.getTimestamp()), chalk.blue(`[INFO] ${msg}`)),
@@ -45,17 +49,73 @@ const logger = {
     }
 };
 
-// Original checkBalance function
+// Gas price helper functions
+async function getDynamicGasPrice(provider) {
+    try {
+        // Get current gas price from network
+        const feeData = await provider.getFeeData();
+        
+        // Use much lower default values
+        const baseFee = feeData.lastBaseFeePerGas || ethers.utils.parseUnits('0.008', 'gwei');
+        const priorityFee = ethers.utils.parseUnits('0.008', 'gwei'); // Fixed lower priority fee
+        
+        // Calculate max fee more conservatively
+        const maxFeePerGas = baseFee.add(priorityFee);
+        
+        logger.info(`Dynamic Gas Prices obtained:
+        Base Fee: ${formatHelper.formatGwei(baseFee)}
+        Priority Fee: ${formatHelper.formatGwei(priorityFee)}
+        Max Fee: ${formatHelper.formatGwei(maxFeePerGas)}`);
+        
+        return {
+            maxFeePerGas,
+            maxPriorityFeePerGas: priorityFee
+        };
+    } catch (error) {
+        logger.warning(`Failed to get dynamic gas price: ${error.message}`);
+        // Fallback to much lower static gas price
+        const staticGasPrice = ethers.utils.parseUnits('0.01', 'gwei');
+        logger.info(`Using fallback gas price: ${formatHelper.formatGwei(staticGasPrice)}`);
+        return {
+            maxFeePerGas: staticGasPrice,
+            maxPriorityFeePerGas: staticGasPrice
+        };
+    }
+}
+
+async function estimateGasWithFallback(wallet, txRequest) {
+    try {
+        const gasEstimate = await wallet.provider.estimateGas(txRequest);
+        // Add 20% buffer to estimated gas
+        const gasWithBuffer = gasEstimate.mul(120).div(100);
+        logger.info(`Gas estimation successful: ${gasEstimate.toString()} (with 20% buffer: ${gasWithBuffer.toString()})`);
+        return gasWithBuffer;
+    } catch (error) {
+        // Extract only the main error message without the details
+        const errorMessage = error.message.split(';')[0];
+        logger.warning(`${errorMessage}`);
+        // Fallback to default gas limit
+        const defaultGas = ethers.BigNumber.from('350000');
+        logger.info(`Using fallback gas limit: ${defaultGas.toString()}`);
+        return defaultGas;
+    }
+}
+
+// Check balance function with gas price parameters
 async function checkBalance(wallet, amount, gasEstimate, gasPrice) {
     const balance = await wallet.getBalance();
     const totalCost = amount.add(gasEstimate.mul(gasPrice));
-    console.log(`Balance: ${ethers.utils.formatEther(balance)} ETH`);
-    console.log(`Total cost: ${ethers.utils.formatEther(totalCost)} ETH`);
-    console.log(`Gas cost: ${ethers.utils.formatEther(gasEstimate.mul(gasPrice))} ETH`);
+    
+    logger.info(`Balance Check:
+    Current Balance: ${formatHelper.formatEthValue(balance)}
+    Transaction Amount: ${formatHelper.formatEthValue(amount)}
+    Estimated Gas Cost: ${formatHelper.formatEthValue(gasEstimate.mul(gasPrice))}
+    Total Cost: ${formatHelper.formatEthValue(totalCost)}`);
+    
     return balance.gte(totalCost);
 }
 
-// Original createSwap function (unchanged)
+// Main swap function with dynamic gas
 async function createSwap(wallet, amount, recipient) {
     const params = [
         config.TOKEN_IN,
@@ -82,27 +142,33 @@ async function createSwap(wallet, amount, recipient) {
         type: 2
     };
 
-    const gasEstimate = await wallet.provider.estimateGas(txRequest);
-    //console.log(`Estimated gas: ${gasEstimate.toString()}`);
+    // Get dynamic gas price
+    const { maxFeePerGas, maxPriorityFeePerGas } = await getDynamicGasPrice(wallet.provider);
 
-    const gasPrice = ethers.utils.parseUnits(config.GAS_PRICE_GWEI, 'gwei');
+    // Estimate gas with fallback
+    const gasLimit = await estimateGasWithFallback(wallet, txRequest);
 
-    const hasEnoughBalance = await checkBalance(wallet, amount, gasEstimate, gasPrice);
+    // Check if we have enough balance
+    const hasEnoughBalance = await checkBalance(wallet, amount, gasLimit, maxFeePerGas);
     if (!hasEnoughBalance) {
         throw new Error('Insufficient balance for transaction');
     }
 
     return {
         ...txRequest,
-        gasLimit: 350000,
-        maxFeePerGas: gasPrice,
-        maxPriorityFeePerGas: gasPrice
+        gasLimit,
+        maxFeePerGas,
+        maxPriorityFeePerGas
     };
 }
+
+// Sequential swap function with dynamic gas
 async function createSequentialSwap(wallet, amount, recipient) {
-    logger.info('Starting Sequential Swap Process');
+    logger.info('Starting Sequential Swap Process with Dynamic Gas');
     logger.info('Checking initial balances...');
     await checkBalances(wallet);
+
+    const { maxFeePerGas, maxPriorityFeePerGas } = await getDynamicGasPrice(wallet.provider);
 
     const swapParams1 = [
         config.TOKEN_IN,
@@ -122,24 +188,29 @@ async function createSequentialSwap(wallet, amount, recipient) {
     ]);
 
     let currentNonce = await wallet.getTransactionCount();
-    const gasPrice = ethers.utils.parseUnits(config.GAS_PRICE_GWEI, 'gwei');
 
-    // Step 1: ETH to USDC
-    const swapData1 = iface.encodeFunctionData('exactInputSingle', [swapParams1]);
-    const tx1 = {
+    // Base transaction parameters
+    const baseTxParams = {
         chainId: config.CHAIN_ID,
+        type: 2,
+        maxFeePerGas,
+        maxPriorityFeePerGas
+    };
+
+    // Step 1: ETH to USDC with dynamic gas
+    const swapData1 = iface.encodeFunctionData('exactInputSingle', [swapParams1]);
+    const tx1Request = {
+        ...baseTxParams,
         to: config.QUICKSWAP_ROUTER,
         value: amount,
         data: swapData1,
-        type: 2,
-        nonce: currentNonce++,
-        gasLimit: 350000,
-        maxFeePerGas: gasPrice,
-        maxPriorityFeePerGas: gasPrice
+        nonce: currentNonce++
     };
 
+    tx1Request.gasLimit = await estimateGasWithFallback(wallet, tx1Request);
+
     logger.info(`Step 1: Initiating ETH → USDC swap (${formatHelper.formatEthValue(amount)})`);
-    const swap1 = await wallet.sendTransaction(tx1);
+    const swap1 = await wallet.sendTransaction(tx1Request);
     await swap1.wait();
     logger.success(`ETH → USDC swap complete. Hash: ${swap1.hash}`);
 
@@ -148,22 +219,20 @@ async function createSequentialSwap(wallet, amount, recipient) {
     logger.info('Checking balances after ETH → USDC swap...');
     await checkBalances(wallet);
 
-    // Step 2: Approve USDC
+    // Step 2: Approve USDC with dynamic gas
     const approveData = iface.encodeFunctionData('approve', [config.QUICKSWAP_ROUTER, ethers.constants.MaxUint256]);
-    const approveTx = {
-        chainId: config.CHAIN_ID,
+    const approveTxRequest = {
+        ...baseTxParams,
         to: config.TOKEN_OUT,
         value: 0,
         data: approveData,
-        type: 2,
-        nonce: currentNonce++,
-        gasLimit: 350000,
-        maxFeePerGas: gasPrice,
-        maxPriorityFeePerGas: gasPrice
+        nonce: currentNonce++
     };
 
+    approveTxRequest.gasLimit = await estimateGasWithFallback(wallet, approveTxRequest);
+
     logger.info('Step 2: Approving USDC for QuickSwap Router...');
-    const approve = await wallet.sendTransaction(approveTx);
+    const approve = await wallet.sendTransaction(approveTxRequest);
     await approve.wait();
     logger.success(`USDC approval complete. Hash: ${approve.hash}`);
 
@@ -171,7 +240,7 @@ async function createSequentialSwap(wallet, amount, recipient) {
     await new Promise(resolve => setTimeout(resolve, 2000));
     const { usdcBalance } = await checkBalances(wallet);
 
-    // Step 3: USDC to WETH
+    // Step 3: USDC to WETH with dynamic gas
     const swapParams2 = [
         config.TOKEN_OUT,
         config.TOKEN_IN,
@@ -184,20 +253,18 @@ async function createSequentialSwap(wallet, amount, recipient) {
     ];
 
     const swapData2 = iface.encodeFunctionData('exactInputSingle', [swapParams2]);
-    const tx2 = {
-        chainId: config.CHAIN_ID,
+    const tx2Request = {
+        ...baseTxParams,
         to: config.QUICKSWAP_ROUTER,
         value: 0,
         data: swapData2,
-        type: 2,
-        nonce: currentNonce++,
-        gasLimit: 350000,
-        maxFeePerGas: gasPrice,
-        maxPriorityFeePerGas: gasPrice
+        nonce: currentNonce++
     };
 
+    tx2Request.gasLimit = await estimateGasWithFallback(wallet, tx2Request);
+
     logger.info(`Step 3: Initiating USDC → WETH swap (${formatHelper.formatUsdcValue(usdcBalance)})`);
-    const swap2 = await wallet.sendTransaction(tx2);
+    const swap2 = await wallet.sendTransaction(tx2Request);
     await swap2.wait();
     logger.success(`USDC → WETH swap complete. Hash: ${swap2.hash}`);
 
@@ -207,44 +274,40 @@ async function createSequentialSwap(wallet, amount, recipient) {
     const wethBalance = await getWETHBalance(wallet);
     logger.info(`WETH Balance: ${formatHelper.formatEthValue(wethBalance)}`);
 
-    // Step 4: Approve WETH
+    // Step 4: Approve WETH with dynamic gas
     const approveWethData = iface.encodeFunctionData('approve', [config.QUICKSWAP_ROUTER, ethers.constants.MaxUint256]);
-    const approveWethTx = {
-        chainId: config.CHAIN_ID,
-        to: config.TOKEN_IN, // WETH contract address
+    const approveWethTxRequest = {
+        ...baseTxParams,
+        to: config.TOKEN_IN,
         value: 0,
         data: approveWethData,
-        type: 2,
-        nonce: currentNonce++,
-        gasLimit: 350000,
-        maxFeePerGas: gasPrice,
-        maxPriorityFeePerGas: gasPrice
+        nonce: currentNonce++
     };
 
+    approveWethTxRequest.gasLimit = await estimateGasWithFallback(wallet, approveWethTxRequest);
+
     logger.info('Step 4: Approving WETH...');
-    const approveWeth = await wallet.sendTransaction(approveWethTx);
+    const approveWeth = await wallet.sendTransaction(approveWethTxRequest);
     await approveWeth.wait();
     logger.success(`WETH approval complete. Hash: ${approveWeth.hash}`);
 
     // Wait before withdrawal
     await new Promise(resolve => setTimeout(resolve, 2000));
 
-    // Step 5: WETH to ETH (Withdraw)
+    // Step 5: WETH to ETH (Withdraw) with dynamic gas
     const withdrawData = iface.encodeFunctionData('withdraw', [wethBalance]);
-    const withdrawTx = {
-        chainId: config.CHAIN_ID,
-        to: config.TOKEN_IN, // WETH contract address
+    const withdrawTxRequest = {
+        ...baseTxParams,
+        to: config.TOKEN_IN,
         value: 0,
         data: withdrawData,
-        type: 2,
-        nonce: currentNonce++,
-        gasLimit: 100000, // Lower gas limit for withdraw
-        maxFeePerGas: gasPrice,
-        maxPriorityFeePerGas: gasPrice
+        nonce: currentNonce++
     };
 
+    withdrawTxRequest.gasLimit = await estimateGasWithFallback(wallet, withdrawTxRequest);
+
     logger.info(`Step 5: Withdrawing WETH to ETH (${formatHelper.formatEthValue(wethBalance)})`);
-    const withdraw = await wallet.sendTransaction(withdrawTx);
+    const withdraw = await wallet.sendTransaction(withdrawTxRequest);
     await withdraw.wait();
     logger.success(`WETH → ETH withdrawal complete. Hash: ${withdraw.hash}`);
 
@@ -253,7 +316,7 @@ async function createSequentialSwap(wallet, amount, recipient) {
     logger.info('Final balances:');
     await checkBalances(wallet);
 
-    return tx1;
+    return tx1Request;
 }
 
 // Helper function to get WETH balance
@@ -265,7 +328,7 @@ async function getWETHBalance(wallet) {
     return await wethContract.balanceOf(wallet.address);
 }
 
-// Update checkBalances function to include WETH
+// Balance checking function
 async function checkBalances(wallet) {
     const ethBalance = await wallet.getBalance();
     const usdcInterface = new ethers.utils.Interface([
@@ -301,20 +364,20 @@ async function processWallet(privateKey, walletIndex, userConfig) {
             const amountInWei = ethers.utils.parseEther(userConfig.amountPerSwap || config.DEFAULT_AMOUNT);
             
             if (userConfig.sequentialSwap) {
-                // Untuk sequential swap
+                // For sequential swap
                 await createSequentialSwap(wallet, amountInWei, wallet.address);
                 logger.success(`Sequential Swap ${i + 1} completed successfully`);
                 successCount++;
             } else {
-                // Untuk single swap biasa
+                // For single swap
                 const tx = await createSwap(wallet, amountInWei, wallet.address);
                 tx.nonce = await wallet.getTransactionCount();
 
-                console.log('Transaction details:', {
+                logger.info('Transaction details:', {
                     gasLimit: tx.gasLimit.toString(),
-                    maxFeePerGas: ethers.utils.formatUnits(tx.maxFeePerGas, 'gwei') + ' Gwei',
-                    maxPriorityFeePerGas: ethers.utils.formatUnits(tx.maxPriorityFeePerGas, 'gwei') + ' Gwei',
-                    value: ethers.utils.formatEther(tx.value) + ' ETH'
+                    maxFeePerGas: formatHelper.formatGwei(tx.maxFeePerGas),
+                    maxPriorityFeePerGas: formatHelper.formatGwei(tx.maxPriorityFeePerGas),
+                    value: formatHelper.formatEthValue(tx.value)
                 });
                 
                 const signedTx = await wallet.sendTransaction(tx);
